@@ -22,9 +22,6 @@ export interface ModelViewerProps {
   enableOrbitControls?: boolean;
   background?: 'light' | 'dark';
   onPick?: (hit: PickResult) => void;
-  onColorPick?: (hit: PickResult) => void;
-  selectedStructureId?: string | null;
-  selectedStructureColor?: string | null;
   exposeApi?: (api: ModelViewerApi) => void;
   labels?: Label3D[];
   preserveCameraState?: boolean;
@@ -34,7 +31,6 @@ export interface ModelViewerProps {
 
 export interface ModelViewerApi {
   resetView: () => void;
-  resetColors: () => void;
   logMeshNames: () => void;
   getMeshNames: () => string[];
   getCameraState: () => CameraState | null;
@@ -58,14 +54,6 @@ interface MaterialCache {
 }
 
 const materialCache = new Map<string, MaterialCache>();
-
-// Color painting state: stores original materials and colored mesh states
-type OriginalMaterialMap = Record<string, THREE.Material | THREE.Material[]>;
-type MeshColorState = Record<string, string>; // meshId -> hexColor
-
-// Store original materials per model URL (reset when URL changes)
-const originalMaterialsMap = new Map<string, OriginalMaterialMap>();
-const coloredMeshesMap = new Map<string, MeshColorState>();
 
 /**
  * ROOT CAUSE OF FLICKERING (FIXED):
@@ -140,9 +128,6 @@ function SceneContent({
   enableOrbitControls = true,
   background = 'dark',
   onPick,
-  onColorPick,
-  selectedStructureId,
-  selectedStructureColor,
   apiRef,
   labels = [],
   preserveCameraState = false,
@@ -153,9 +138,6 @@ function SceneContent({
   enableOrbitControls: boolean;
   background: 'light' | 'dark';
   onPick?: (hit: PickResult) => void;
-  onColorPick?: (hit: PickResult) => void;
-  selectedStructureId?: string | null;
-  selectedStructureColor?: string | null;
   apiRef: React.MutableRefObject<ModelViewerApi | null> | React.RefObject<ModelViewerApi | null>;
   labels?: Label3D[];
   preserveCameraState?: boolean;
@@ -169,37 +151,8 @@ function SceneContent({
   const initialCameraStateRef = useRef<CameraState | null>(null);
   const hasAutoFittedRef = useRef(false);
   const hasNormalizedScaleRef = useRef(false);
-  const hasStoredOriginalMaterialsRef = useRef(false);
 
   const { camera, gl } = useThree();
-
-  // Store original materials when model loads (for color reset)
-  useEffect(() => {
-    if (!scene || hasStoredOriginalMaterialsRef.current) return;
-
-    const originalMaterials: OriginalMaterialMap = {};
-
-    scene.traverse((object) => {
-      if (object instanceof THREE.Mesh && object.material) {
-        const meshId = object.uuid;
-        // Store original material(s) - handle both single and array
-        if (Array.isArray(object.material)) {
-          originalMaterials[meshId] = object.material.map(mat => mat.clone());
-        } else {
-          originalMaterials[meshId] = object.material.clone();
-        }
-      }
-    });
-
-    originalMaterialsMap.set(url, originalMaterials);
-    hasStoredOriginalMaterialsRef.current = true;
-  }, [scene, url]);
-
-  // Reset stored materials when URL changes
-  useEffect(() => {
-    hasStoredOriginalMaterialsRef.current = false;
-    coloredMeshesMap.delete(url);
-  }, [url]);
 
   // Helper to normalize mesh names for comparison
   const normalizeName = (name: string): string => {
@@ -466,40 +419,9 @@ function SceneContent({
 
   // Handle pointer events on the scene using R3F events
   const handlePointerDown = (event: any) => {
-    event.stopPropagation();
-    
-    if (onColorPick && selectedStructureId && selectedStructureColor) {
-      // Color mode: paint the clicked mesh
-      const object = event.object;
+    if (onPick) {
+      event.stopPropagation();
       
-      // Find the mesh (could be the object itself or a parent)
-      let mesh: THREE.Mesh | null = null;
-      let current: THREE.Object3D | null = object;
-      
-      while (current) {
-        if (current instanceof THREE.Mesh) {
-          mesh = current;
-          break;
-        }
-        current = current.parent;
-      }
-      
-      if (mesh) {
-        // Apply color directly to the mesh
-        applyColorToMesh(mesh, selectedStructureColor);
-        
-        // Also call onColorPick callback for external handling if needed
-        onColorPick({
-          point: [
-            event.point.x,
-            event.point.y,
-            event.point.z,
-          ],
-          objectName: mesh.name || mesh.uuid,
-        });
-      }
-    } else if (onPick) {
-      // Label mode: standard pick handling
       if (event.point) {
         const object = event.object;
         
@@ -537,7 +459,7 @@ function SceneContent({
       
       <group 
         ref={groupRef}
-        onPointerDown={(onPick || onColorPick) ? handlePointerDown : undefined}
+        onPointerDown={onPick ? handlePointerDown : undefined}
       >
         <primitive object={scene} />
       </group>
@@ -639,7 +561,7 @@ export { printSceneGraph, getMeshNames };
 
 // Main ModelViewer component
 export const ModelViewer = forwardRef<ModelViewerApi, ModelViewerProps>(
-  ({ url, enableOrbitControls = true, background = 'dark', onPick, onColorPick, selectedStructureId, selectedStructureColor, exposeApi, labels = [], preserveCameraState = false, highlightMeshNames = [], dimOthers = true }, ref) => {
+  ({ url, enableOrbitControls = true, background = 'dark', onPick, exposeApi, labels = [], preserveCameraState = false, highlightMeshNames = [], dimOthers = true }, ref) => {
     const [error, setError] = useState<string | null>(null);
     const apiRef = useRef<ModelViewerApi | null>(null);
 
@@ -666,9 +588,6 @@ export const ModelViewer = forwardRef<ModelViewerApi, ModelViewerProps>(
               enableOrbitControls={enableOrbitControls}
               background={background as 'light' | 'dark'}
               onPick={onPick}
-              onColorPick={onColorPick}
-              selectedStructureId={selectedStructureId}
-              selectedStructureColor={selectedStructureColor}
               apiRef={apiRef}
               labels={labels}
               preserveCameraState={preserveCameraState}
