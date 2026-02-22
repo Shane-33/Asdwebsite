@@ -1,6 +1,6 @@
-import React, { Suspense, useRef, useEffect, useState, forwardRef } from 'react';
+import React, { Suspense, useRef, useEffect, useState, forwardRef, memo, useMemo } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, useGLTF, useProgress, Html } from '@react-three/drei';
+import { OrbitControls, useGLTF, useProgress, Html, Text } from '@react-three/drei';
 import { Button } from '@/app/components/ui/button';
 import { RotateCcw, AlertCircle } from 'lucide-react';
 import * as THREE from 'three';
@@ -22,6 +22,9 @@ export interface ModelViewerProps {
   enableOrbitControls?: boolean;
   background?: 'light' | 'dark';
   onPick?: (hit: PickResult) => void;
+  onColorPick?: (hit: PickResult) => void;
+  selectedStructureId?: string | null;
+  selectedStructureColor?: string | null;
   exposeApi?: (api: ModelViewerApi) => void;
   labels?: Label3D[];
   preserveCameraState?: boolean;
@@ -31,6 +34,7 @@ export interface ModelViewerProps {
 
 export interface ModelViewerApi {
   resetView: () => void;
+  resetColors: () => void;
   logMeshNames: () => void;
   getMeshNames: () => string[];
   getCameraState: () => CameraState | null;
@@ -55,12 +59,90 @@ interface MaterialCache {
 
 const materialCache = new Map<string, MaterialCache>();
 
+// Color painting state: stores original materials and colored mesh states
+type OriginalMaterialMap = Record<string, THREE.Material | THREE.Material[]>;
+type MeshColorState = Record<string, string>; // meshId -> hexColor
+
+// Store original materials per model URL (reset when URL changes)
+const originalMaterialsMap = new Map<string, OriginalMaterialMap>();
+const coloredMeshesMap = new Map<string, MeshColorState>();
+
+/**
+ * ROOT CAUSE OF FLICKERING (FIXED):
+ * 1. Html components from drei create DOM overlays that can flicker during camera movements
+ * 2. Html without distanceFactor causes size instability
+ * 3. occlude prop causes labels to hide/show rapidly
+ * 
+ * SOLUTION: Use drei Text component for stable 3D rendering
+ * - Text renders as 3D geometry, not DOM overlay
+ * - Constant fontSize in world units keeps size stable
+ * - No occlude issues, labels stay visible
+ * - Small colored sphere as visual marker
+ */
+const LabelMarker = memo(({ label }: { label: Label3D }) => {
+  // Offset label slightly along Y axis to prevent z-fighting with model surface
+  const labelPosition: [number, number, number] = [
+    label.position[0],
+    label.position[1] + 0.05, // Small offset upward
+    label.position[2]
+  ];
+  
+  // Convert hex color to THREE.Color
+  const color = new THREE.Color(label.color);
+  
+  return (
+    <group position={labelPosition}>
+      {/* Small colored sphere as marker dot */}
+      <mesh>
+        <sphereGeometry args={[0.02, 16, 16]} />
+        <meshStandardMaterial 
+          color={color} 
+          emissive={color}
+          emissiveIntensity={0.3}
+          depthTest={false} // Prevent z-fighting
+        />
+      </mesh>
+      
+      {/* Text label - positioned to the right of the marker */}
+      <Text
+        position={[0.04, 0, 0]} // Offset to the right of marker
+        fontSize={0.08} // World units - keeps size consistent
+        anchorX="left"
+        anchorY="middle"
+        color="white"
+        outlineWidth={0.01}
+        outlineColor="#000000"
+        depthTest={false} // Prevent text from disappearing behind model
+        renderOrder={1000} // Render on top
+      >
+        {label.text}
+      </Text>
+    </group>
+  );
+}, (prevProps, nextProps) => {
+  // Custom comparison: only re-render if label properties actually change
+  // This prevents unnecessary re-renders during camera movements
+  return (
+    prevProps.label.id === nextProps.label.id &&
+    prevProps.label.text === nextProps.label.text &&
+    prevProps.label.color === nextProps.label.color &&
+    prevProps.label.position[0] === nextProps.label.position[0] &&
+    prevProps.label.position[1] === nextProps.label.position[1] &&
+    prevProps.label.position[2] === nextProps.label.position[2]
+  );
+});
+
+LabelMarker.displayName = 'LabelMarker';
+
 // Internal component that handles the 3D scene
 function SceneContent({
   url,
   enableOrbitControls = true,
   background = 'dark',
   onPick,
+  onColorPick,
+  selectedStructureId,
+  selectedStructureColor,
   apiRef,
   labels = [],
   preserveCameraState = false,
@@ -71,6 +153,9 @@ function SceneContent({
   enableOrbitControls: boolean;
   background: 'light' | 'dark';
   onPick?: (hit: PickResult) => void;
+  onColorPick?: (hit: PickResult) => void;
+  selectedStructureId?: string | null;
+  selectedStructureColor?: string | null;
   apiRef: React.MutableRefObject<ModelViewerApi | null> | React.RefObject<ModelViewerApi | null>;
   labels?: Label3D[];
   preserveCameraState?: boolean;
@@ -83,13 +168,105 @@ function SceneContent({
   const groupRef = useRef<THREE.Group>(null);
   const initialCameraStateRef = useRef<CameraState | null>(null);
   const hasAutoFittedRef = useRef(false);
+  const hasNormalizedScaleRef = useRef(false);
+  const hasStoredOriginalMaterialsRef = useRef(false);
 
   const { camera, gl } = useThree();
+
+  // Store original materials when model loads (for color reset)
+  useEffect(() => {
+    if (!scene || hasStoredOriginalMaterialsRef.current) return;
+
+    const originalMaterials: OriginalMaterialMap = {};
+
+    scene.traverse((object) => {
+      if (object instanceof THREE.Mesh && object.material) {
+        const meshId = object.uuid;
+        // Store original material(s) - handle both single and array
+        if (Array.isArray(object.material)) {
+          originalMaterials[meshId] = object.material.map(mat => mat.clone());
+        } else {
+          originalMaterials[meshId] = object.material.clone();
+        }
+      }
+    });
+
+    originalMaterialsMap.set(url, originalMaterials);
+    hasStoredOriginalMaterialsRef.current = true;
+  }, [scene, url]);
+
+  // Reset stored materials when URL changes
+  useEffect(() => {
+    hasStoredOriginalMaterialsRef.current = false;
+    coloredMeshesMap.delete(url);
+  }, [url]);
 
   // Helper to normalize mesh names for comparison
   const normalizeName = (name: string): string => {
     return name.trim().replace(/\s+/g, '').replace(/_/g, '').toLowerCase();
   };
+
+  /**
+   * SCALE NORMALIZATION FIX:
+   * Different GLB models have different internal units/scale.
+   * This normalizes all models to a consistent target size so S4-S6 match S1-S3.
+   * 
+   * Approach: Compute bounding box, calculate scale factor to match target size,
+   * apply scale to scene root, and center the model.
+   * 
+   * Reset normalization ref when URL changes so new models get normalized.
+   */
+  useEffect(() => {
+    // Reset normalization flag when URL changes (new model loaded)
+    hasNormalizedScaleRef.current = false;
+  }, [url]);
+
+  useEffect(() => {
+    if (!scene || hasNormalizedScaleRef.current) return;
+
+    try {
+      // Compute bounding box of the entire scene
+      const box = new THREE.Box3().setFromObject(scene);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      
+      // Get the maximum dimension (ensures model fits consistently)
+      const currentMaxDim = Math.max(size.x, size.y, size.z);
+      
+      // Target size based on typical S1-S3 model size (adjust if needed)
+      // This ensures all models appear the same size in viewport
+      const targetMaxDim = 2.0; // Adjust this value to match S1-S3 size
+      
+      if (currentMaxDim > 0 && Math.abs(currentMaxDim - targetMaxDim) > 0.01) {
+        // Calculate scale factor
+        const scaleFactor = targetMaxDim / currentMaxDim;
+        
+        // Apply scale to scene root
+        scene.scale.setScalar(scaleFactor);
+        
+        // Recompute bounding box after scaling
+        box.setFromObject(scene);
+        const center = box.getCenter(new THREE.Vector3());
+        
+        // Center the model at origin (optional, but helps with consistency)
+        scene.position.sub(center);
+        
+        // Mark as normalized to prevent re-applying
+        hasNormalizedScaleRef.current = true;
+        
+        // Temporary debug log (remove after confirmation)
+        console.log(`[ModelViewer] Scale normalized for ${url}: ${currentMaxDim.toFixed(3)} -> ${targetMaxDim.toFixed(3)} (factor: ${scaleFactor.toFixed(3)})`);
+      } else {
+        // Model is already close to target size, mark as normalized
+        hasNormalizedScaleRef.current = true;
+        console.log(`[ModelViewer] Model ${url} already at target size: ${currentMaxDim.toFixed(3)}`);
+      }
+    } catch (error) {
+      console.warn('[ModelViewer] Failed to normalize scale:', error);
+      // Mark as normalized anyway to prevent retry loops
+      hasNormalizedScaleRef.current = true;
+    }
+  }, [scene, url]);
 
   // Apply highlighting to meshes
   useEffect(() => {
@@ -289,9 +466,40 @@ function SceneContent({
 
   // Handle pointer events on the scene using R3F events
   const handlePointerDown = (event: any) => {
-    if (onPick) {
-      event.stopPropagation();
+    event.stopPropagation();
+    
+    if (onColorPick && selectedStructureId && selectedStructureColor) {
+      // Color mode: paint the clicked mesh
+      const object = event.object;
       
+      // Find the mesh (could be the object itself or a parent)
+      let mesh: THREE.Mesh | null = null;
+      let current: THREE.Object3D | null = object;
+      
+      while (current) {
+        if (current instanceof THREE.Mesh) {
+          mesh = current;
+          break;
+        }
+        current = current.parent;
+      }
+      
+      if (mesh) {
+        // Apply color directly to the mesh
+        applyColorToMesh(mesh, selectedStructureColor);
+        
+        // Also call onColorPick callback for external handling if needed
+        onColorPick({
+          point: [
+            event.point.x,
+            event.point.y,
+            event.point.z,
+          ],
+          objectName: mesh.name || mesh.uuid,
+        });
+      }
+    } else if (onPick) {
+      // Label mode: standard pick handling
       if (event.point) {
         const object = event.object;
         
@@ -329,34 +537,14 @@ function SceneContent({
       
       <group 
         ref={groupRef}
-        onPointerDown={onPick ? handlePointerDown : undefined}
+        onPointerDown={(onPick || onColorPick) ? handlePointerDown : undefined}
       >
         <primitive object={scene} />
       </group>
 
-      {/* Render 3D labels */}
+      {/* Render 3D labels - Memoized to prevent flickering */}
       {labels.map((label) => (
-        <Html
-          key={label.id}
-          position={label.position}
-          center
-          transform
-          occlude
-          style={{ pointerEvents: 'none' }}
-        >
-          <div 
-            className="bg-slate-900/95 backdrop-blur-sm px-3 py-1.5 rounded-full border shadow-lg flex items-center gap-2"
-            style={{ 
-              borderColor: `${label.color}80`,
-            }}
-          >
-            <div 
-              className="w-2 h-2 rounded-full"
-              style={{ backgroundColor: label.color }}
-            />
-            <p className="text-xs text-white font-medium whitespace-nowrap">{label.text}</p>
-          </div>
-        </Html>
+        <LabelMarker key={label.id} label={label} />
       ))}
 
       {enableOrbitControls && (
@@ -451,7 +639,7 @@ export { printSceneGraph, getMeshNames };
 
 // Main ModelViewer component
 export const ModelViewer = forwardRef<ModelViewerApi, ModelViewerProps>(
-  ({ url, enableOrbitControls = true, background = 'dark', onPick, exposeApi, labels = [], preserveCameraState = false, highlightMeshNames = [], dimOthers = true }, ref) => {
+  ({ url, enableOrbitControls = true, background = 'dark', onPick, onColorPick, selectedStructureId, selectedStructureColor, exposeApi, labels = [], preserveCameraState = false, highlightMeshNames = [], dimOthers = true }, ref) => {
     const [error, setError] = useState<string | null>(null);
     const apiRef = useRef<ModelViewerApi | null>(null);
 
@@ -478,6 +666,9 @@ export const ModelViewer = forwardRef<ModelViewerApi, ModelViewerProps>(
               enableOrbitControls={enableOrbitControls}
               background={background as 'light' | 'dark'}
               onPick={onPick}
+              onColorPick={onColorPick}
+              selectedStructureId={selectedStructureId}
+              selectedStructureColor={selectedStructureColor}
               apiRef={apiRef}
               labels={labels}
               preserveCameraState={preserveCameraState}

@@ -1,7 +1,6 @@
-import React, { useState, useEffect, useRef, lazy } from "react";
+import React, { useState, useEffect, useRef, lazy, useMemo, useCallback } from "react";
 import { Button } from "@/app/components/ui/button";
-import { CheckCircle2, RotateCcw, Bug, X } from "lucide-react";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/app/components/ui/tabs";
+import { CheckCircle2, RotateCcw, Bug, X, Palette, Tag } from "lucide-react";
 import { Slider } from "@/app/components/ui/slider";
 import confetti from "canvas-confetti";
 import { ModelViewerApi, Label3D } from "@/app/components/ModelViewer";
@@ -15,6 +14,19 @@ interface PlacedLabel {
   id: string;
   structureId: string;
   position: [number, number, number];
+  placedAt: number; // Timestamp for stable sorting
+}
+
+/**
+ * Stable ID generator - ensures unique, stable IDs for labels
+ * Uses a counter combined with timestamp to guarantee uniqueness
+ * This prevents React from re-mounting labels due to key changes
+ */
+let labelIdCounter = 0;
+function generateStableLabelId(): string {
+  // Use performance.now() for better precision, or fallback to Date.now()
+  const timestamp = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  return `label-${timestamp}-${++labelIdCounter}`;
 }
 
 const structureInfo: Record<string, { develops: string; description: string }> = {
@@ -34,34 +46,42 @@ const stageDescriptions: Record<number, string> = {
   2: "The opening between septum primum and endocardial cushions remains open (foramen primum).",
   3: "An opening is created in septum primum (foramen secundum) through apoptosis.",
   4: "Septum primum fuses with the endocardial cushion, closing the foramen primum.",
-  5: "Septum secundum grows on the right of septum primum in two parts: superior and inferior.",
-  6: "The space between the two parts of septum secundum forms the foramen ovale. The superior portion of septum primum regresses, while the inferior portion persists as a one-way valve.",
+  5: "Septum secundum grows on the right of septum primum in two parts: superior and inferior. The space between the two parts of septum secundum forms the foramen ovale. The superior portion of septum primum regresses, while the inferior portion persists as a one-way valve.",
 };
 
 interface HeartLabelingProps {
   onComplete?: () => void;
 }
 
-// Preload developmental models
-const preloadDevelopmentalModels = () => {
-  const urls = Array.from({ length: 6 }, (_, i) => `/models/week5/dev/s${i}.glb`);
-  urls.forEach((url) => {
-    try {
-      useGLTF.preload(url);
-    } catch (error) {
-      console.warn(`Failed to preload ${url}:`, error);
-    }
-  });
-};
 
+/**
+ * HeartLabeling Component
+ * 
+ * FIX IMPLEMENTED:
+ * - Removed embryology mode - this component is now labeling-only
+ * - Removed mode switch buttons - no longer needed
+ * - Removed developmental sequence panel/slider from labeling page
+ * - Embryologic Sequence is now handled by InteractiveDevelopment component
+ * 
+ * This component focuses solely on:
+ * - 3D heart model labeling (4-chamber configuration)
+ * - Structure selection and label placement
+ * - Label verification and completion
+ * 
+ * TEST CHECKLIST:
+ * - [ ] Labeling page contains only labeling UI (no developmental sequence)
+ * - [ ] No mode switch buttons visible
+ * - [ ] No stage slider or stage descriptions
+ * - [ ] Only shows structure list and 3D labeling model
+ */
 export function HeartLabeling({ onComplete }: HeartLabelingProps) {
-  const [activeTab, setActiveTab] = useState<"structures" | "sequence">("structures");
+  // Interaction mode: 'label' or 'color'
+  const [interactionMode, setInteractionMode] = useState<"label" | "color">("label");
   const [selectedStructureId, setSelectedStructureId] = useState<string | null>(null);
   const [placedLabels, setPlacedLabels] = useState<PlacedLabel[]>([]);
   const [showResults, setShowResults] = useState(false);
   const [showToast, setShowToast] = useState<string | null>(null);
   const viewerApiRef = useRef<ModelViewerApi | null>(null);
-  const [devStage, setDevStage] = useState(0);
   const [isDevMode] = useState(() => {
     try {
       return import.meta.env.DEV || process.env.NODE_ENV === 'development';
@@ -70,7 +90,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
     }
   });
 
-  // Preload models on mount
+  // Preload models on mount - only 4-chamber model needed for labeling
   useEffect(() => {
     // Preload 4-chamber model
     try {
@@ -78,9 +98,6 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
     } catch (error) {
       console.warn('Failed to preload 4-chamber model:', error);
     }
-
-    // Preload developmental models
-    preloadDevelopmentalModels();
   }, []);
 
   // Show toast message
@@ -89,31 +106,34 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
     setTimeout(() => setShowToast(null), 3000);
   };
 
-  const modelUrl = activeTab === "structures" 
-    ? "/models/week5/heart_4chamber.glb"
-    : `/models/week5/dev/s${devStage}.glb`;
+  // Model URL - always 4-chamber model for labeling
+  const modelUrl = useMemo(() => {
+    return "/models/week5/heart_4chamber.glb";
+  }, []);
 
   // Get highlight mesh names for selected structure
-  const highlightMeshNames = selectedStructureId 
-    ? (() => {
-        const structure = getStructureById(selectedStructureId);
-        if (structure) {
-          return Array.isArray(structure.meshName) ? structure.meshName : [structure.meshName];
-        }
-        return [];
-      })()
-    : [];
+  const highlightMeshNames = useMemo(() => {
+    if (!selectedStructureId) return [];
+    const structure = getStructureById(selectedStructureId);
+    if (structure) {
+      return Array.isArray(structure.meshName) ? structure.meshName : [structure.meshName];
+    }
+    return [];
+  }, [selectedStructureId]);
 
-  // Convert placed labels to 3D format for rendering
-  const labels3D: Label3D[] = placedLabels.map((label) => {
-    const structure = getStructureById(label.structureId);
-    return {
-      id: label.id,
-      text: structure?.displayName || label.structureId,
-      color: structure?.color || "#10B981",
-      position: label.position,
-    };
-  });
+  // Convert placed labels to 3D format for rendering - MEMOIZED to prevent flickering
+  // This ensures labels array reference is stable unless labels actually change
+  const labels3D: Label3D[] = useMemo(() => {
+    return placedLabels.map((label) => {
+      const structure = getStructureById(label.structureId);
+      return {
+        id: label.id, // Stable ID from generateStableLabelId
+        text: structure?.displayName || label.structureId,
+        color: structure?.color || "#10B981",
+        position: label.position,
+      };
+    });
+  }, [placedLabels]); // Only recalculate when placedLabels changes
 
   const handleStructureClick = (structureId: string) => {
     // Check if already placed
@@ -123,44 +143,55 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
     }
   };
 
-  const handleModelPick = (hit: { point: [number, number, number]; objectName: string }) => {
-    if (activeTab !== "structures") return;
+  const handleModelPick = useCallback((hit: { point: [number, number, number]; objectName: string }) => {
+    if (interactionMode === "label") {
+      // Label mode: place labels
+      if (!selectedStructureId) {
+        showToastMessage("Select a structure first");
+        return;
+      }
 
-    if (!selectedStructureId) {
-      showToastMessage("Select a structure first");
-      return;
+      // Normalize mesh name and find matching structure
+      const normalized = normalizeMeshName(hit.objectName);
+      const clickedStructure = getStructureByMeshName(normalized);
+
+      // Check if clicked structure matches selected structure
+      if (clickedStructure && clickedStructure.id === selectedStructureId) {
+        // Place the label with stable ID
+        const newLabel: PlacedLabel = {
+          id: generateStableLabelId(),
+          structureId: selectedStructureId,
+          position: hit.point,
+          placedAt: Date.now(),
+        };
+
+        setPlacedLabels(prev => [...prev, newLabel]);
+        setSelectedStructureId(null); // Clear selection after placing
+      } else if (clickedStructure) {
+        // Wrong structure clicked
+        showToastMessage(`Wrong structure. You selected: ${getStructureById(selectedStructureId)?.displayName}`);
+      } else {
+        // Unknown structure - still allow placement
+        const newLabel: PlacedLabel = {
+          id: generateStableLabelId(),
+          structureId: selectedStructureId,
+          position: hit.point,
+          placedAt: Date.now(),
+        };
+
+        setPlacedLabels(prev => [...prev, newLabel]);
+        setSelectedStructureId(null);
+      }
+    } else if (interactionMode === "color") {
+      // Color mode: paint mesh (handled by ModelViewer)
+      if (!selectedStructureId) {
+        showToastMessage("Select a structure first to apply its color");
+        return;
+      }
+      // Color painting is handled directly in ModelViewer's handlePointerDown
+      // The onColorPick callback is called for external handling if needed
     }
-
-    // Normalize mesh name and find matching structure
-    const normalized = normalizeMeshName(hit.objectName);
-    const clickedStructure = getStructureByMeshName(normalized);
-
-    // Check if clicked structure matches selected structure
-    if (clickedStructure && clickedStructure.id === selectedStructureId) {
-      // Place the label
-      const newLabel: PlacedLabel = {
-        id: `label-${Date.now()}-${Math.random()}`,
-        structureId: selectedStructureId,
-        position: hit.point,
-      };
-
-      setPlacedLabels([...placedLabels, newLabel]);
-      setSelectedStructureId(null); // Clear selection after placing
-    } else if (clickedStructure) {
-      // Wrong structure clicked
-      showToastMessage(`Wrong structure. You selected: ${getStructureById(selectedStructureId)?.displayName}`);
-    } else {
-      // Unknown structure - still allow placement
-      const newLabel: PlacedLabel = {
-        id: `label-${Date.now()}-${Math.random()}`,
-        structureId: selectedStructureId,
-        position: hit.point,
-      };
-
-      setPlacedLabels([...placedLabels, newLabel]);
-      setSelectedStructureId(null);
-    }
-  };
+  }, [interactionMode, selectedStructureId]);
 
   const handleCheckLabels = () => {
     const allPlaced = heartStructures.every(structure => 
@@ -188,6 +219,17 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
     setShowResults(false);
     if (viewerApiRef.current) {
       viewerApiRef.current.resetView();
+      // Also reset colors if in color mode
+      if (interactionMode === "color" && viewerApiRef.current.resetColors) {
+        viewerApiRef.current.resetColors();
+      }
+    }
+  };
+
+  const handleResetColors = () => {
+    if (viewerApiRef.current && viewerApiRef.current.resetColors) {
+      viewerApiRef.current.resetColors();
+      showToastMessage("Colors reset to original");
     }
   };
 
@@ -232,24 +274,50 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
             Label the Cardiac Structures
           </h2>
           <p className="text-lg text-slate-300 max-w-3xl mx-auto">
-            Explore the 4-chamber heart configuration and developmental sequence.
+            Explore the 4-chamber heart configuration. Click on a structure to select it, then click on the 3D model to place the label or apply color.
           </p>
         </div>
 
-        {/* Progress indicator */}
-        {activeTab === "structures" && (
-          <div className="mb-8 flex items-center justify-center gap-3">
-            <div className="text-sm text-slate-400">
-              Labels Placed: {placedLabels.length} / {heartStructures.length}
-            </div>
-            <div className="w-48 h-2 bg-slate-700 rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-all duration-500"
-                style={{ width: `${(placedLabels.length / heartStructures.length) * 100}%` }}
-              />
-            </div>
+        {/* Mode Toggle */}
+        <div className="mb-6 flex items-center justify-center">
+          <div className="inline-flex bg-slate-800/50 rounded-xl p-1 border border-slate-700/50">
+            <button
+              onClick={() => setInteractionMode("label")}
+              className={`px-6 py-3 rounded-lg font-medium transition-all flex items-center gap-2 ${
+                interactionMode === "label"
+                  ? "bg-emerald-500 text-white shadow-lg"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Tag className="w-4 h-4" />
+              Label
+            </button>
+            <button
+              onClick={() => setInteractionMode("color")}
+              className={`px-6 py-3 rounded-lg font-medium transition-all flex items-center gap-2 ${
+                interactionMode === "color"
+                  ? "bg-emerald-500 text-white shadow-lg"
+                  : "text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              <Palette className="w-4 h-4" />
+              Color
+            </button>
           </div>
-        )}
+        </div>
+
+        {/* Progress indicator */}
+        <div className="mb-8 flex items-center justify-center gap-3">
+          <div className="text-sm text-slate-400">
+            Labels Placed: {placedLabels.length} / {heartStructures.length}
+          </div>
+          <div className="w-48 h-2 bg-slate-700 rounded-full overflow-hidden">
+            <div 
+              className="h-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-all duration-500"
+              style={{ width: `${(placedLabels.length / heartStructures.length) * 100}%` }}
+            />
+          </div>
+        </div>
 
         <div className="grid lg:grid-cols-2 gap-8">
           {/* Left: 3D Model Viewport */}
@@ -261,7 +329,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
                   <div>
                     <h3 className="font-semibold text-slate-100">Week 5 Heart</h3>
                     <p className="text-sm text-slate-400">
-                      {activeTab === "structures" ? "4-Chamber Configuration" : `Stage ${devStage}/6`}
+                      4-Chamber Configuration
                     </p>
                   </div>
                   <div className="bg-emerald-500/20 text-emerald-300 px-3 py-1 rounded-full text-sm font-medium border border-emerald-500/30">
@@ -285,17 +353,24 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
                     </div>
                   }>
                     <ModelViewer
+                      // Stable key for labeling model
+                      key="labeling-model"
                       url={modelUrl}
                       enableOrbitControls={true}
                       background="dark"
-                      onPick={activeTab === "structures" ? handleModelPick : undefined}
+                      onPick={interactionMode === "label" ? handleModelPick : undefined}
+                      onColorPick={interactionMode === "color" ? handleModelPick : undefined}
+                      selectedStructureId={interactionMode === "color" ? selectedStructureId : null}
+                      selectedStructureColor={interactionMode === "color" && selectedStructureId 
+                        ? (getStructureById(selectedStructureId)?.color || null)
+                        : null}
                       exposeApi={(api) => {
                         viewerApiRef.current = api;
                       }}
-                      labels={activeTab === "structures" ? labels3D : []}
-                      preserveCameraState={activeTab === "sequence"}
-                      highlightMeshNames={activeTab === "structures" ? highlightMeshNames : []}
-                      dimOthers={activeTab === "structures" && selectedStructureId !== null}
+                      labels={interactionMode === "label" ? labels3D : []}
+                      preserveCameraState={false}
+                      highlightMeshNames={highlightMeshNames}
+                      dimOthers={selectedStructureId !== null}
                     />
                   </React.Suspense>
 
@@ -309,25 +384,20 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
                 <div className="bg-emerald-500/10 px-6 py-3 border-t border-emerald-500/20">
                   <p className="text-sm text-emerald-300">
                     <span className="font-semibold">Note:</span>{" "}
-                    {activeTab === "structures" 
+                    {interactionMode === "label" 
                       ? "Click on a structure to select it, then click on the 3D model to place the label."
-                      : "Use the slider to explore different developmental stages."}
+                      : "Click on a structure to select it, then click on the 3D model to apply its color."}
                   </p>
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Right: Tabs Panel */}
+          {/* Right: Content Panel - Labeling Only */}
           <div className="order-1 lg:order-2">
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl shadow-2xl p-8 border border-slate-700/50">
-              <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as "structures" | "sequence")}>
-                <TabsList className="w-full mb-6">
-                  <TabsTrigger value="structures" className="flex-1">Cardiac Structures</TabsTrigger>
-                  <TabsTrigger value="sequence" className="flex-1">Developmental Sequence</TabsTrigger>
-                </TabsList>
-
-                <TabsContent value="structures">
+              {/* Labeling Mode Content */}
+              <div>
                   {showResults && allLabelsPlaced ? (
                     /* Success State */
                     <div>
@@ -475,37 +545,59 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
 
                       {/* Action Buttons */}
                       <div className="space-y-3">
-                        <Button
-                          onClick={handleCheckLabels}
-                          disabled={!allLabelsPlaced}
-                          className={`w-full py-4 rounded-xl font-medium transition-all ${
-                            allLabelsPlaced
-                              ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white shadow-lg shadow-emerald-500/20'
-                              : 'bg-slate-700/50 text-slate-500 cursor-not-allowed border border-slate-600'
-                          }`}
-                        >
-                          {allLabelsPlaced ? 'Check My Labels' : `Place ${heartStructures.length - placedLabels.length} more label${heartStructures.length - placedLabels.length !== 1 ? 's' : ''}`}
-                        </Button>
-
-                        <div className="flex gap-3">
-                          <Button
-                            onClick={handleReset}
-                            variant="outline"
-                            className="flex-1 bg-slate-700/50 hover:bg-slate-700 text-slate-200 py-4 rounded-xl border border-slate-600"
-                          >
-                            Reset All Labels
-                          </Button>
-
-                          {selectedStructureId && (
+                        {interactionMode === "label" ? (
+                          <>
                             <Button
-                              onClick={handleClearSelection}
-                              variant="outline"
-                              className="flex-1 bg-slate-700/50 hover:bg-slate-700 text-slate-200 py-4 rounded-xl border border-slate-600"
+                              onClick={handleCheckLabels}
+                              disabled={!allLabelsPlaced}
+                              className={`w-full py-4 rounded-xl font-medium transition-all ${
+                                allLabelsPlaced
+                                  ? 'bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white shadow-lg shadow-emerald-500/20'
+                                  : 'bg-slate-700/50 text-slate-500 cursor-not-allowed border border-slate-600'
+                              }`}
                             >
-                              Clear Selection
+                              {allLabelsPlaced ? 'Check My Labels' : `Place ${heartStructures.length - placedLabels.length} more label${heartStructures.length - placedLabels.length !== 1 ? 's' : ''}`}
                             </Button>
-                          )}
-                        </div>
+
+                            <div className="flex gap-3">
+                              <Button
+                                onClick={handleReset}
+                                variant="outline"
+                                className="flex-1 bg-slate-700/50 hover:bg-slate-700 text-slate-200 py-4 rounded-xl border border-slate-600"
+                              >
+                                Reset All Labels
+                              </Button>
+
+                              {selectedStructureId && (
+                                <Button
+                                  onClick={handleClearSelection}
+                                  variant="outline"
+                                  className="flex-1 bg-slate-700/50 hover:bg-slate-700 text-slate-200 py-4 rounded-xl border border-slate-600"
+                                >
+                                  Clear Selection
+                                </Button>
+                              )}
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            {!selectedStructureId && (
+                              <div className="bg-blue-500/10 rounded-xl p-4 border border-blue-500/30 mb-3">
+                                <p className="text-sm text-blue-200">
+                                  <span className="font-semibold">💡 Tip:</span> Select a structure first, then click on the 3D model to apply its color.
+                                </p>
+                              </div>
+                            )}
+                            <Button
+                              onClick={handleResetColors}
+                              variant="outline"
+                              className="w-full bg-slate-700/50 hover:bg-slate-700 text-slate-200 py-4 rounded-xl border border-slate-600"
+                            >
+                              <RotateCcw className="w-4 h-4 mr-2" />
+                              Reset Colors
+                            </Button>
+                          </>
+                        )}
 
                         {isDevMode && (
                           <Button
@@ -520,50 +612,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
                       </div>
                     </div>
                   )}
-                </TabsContent>
-
-                <TabsContent value="sequence">
-                  <div>
-                    <div className="mb-6">
-                      <h3 className="text-2xl text-slate-100 mb-2">Developmental Sequence</h3>
-                      <p className="text-slate-300">
-                        Explore the stages of atrial septation development.
-                      </p>
-                    </div>
-
-                    {/* Stage Indicator */}
-                    <div className="mb-6">
-                      <div className="text-center mb-4">
-                        <span className="text-3xl font-bold text-slate-100">Stage {devStage} / 6</span>
-                      </div>
-                      
-                      {/* Slider */}
-                      <div className="px-2">
-                        <Slider
-                          value={[devStage]}
-                          onValueChange={(values) => setDevStage(values[0])}
-                          min={0}
-                          max={5}
-                          step={1}
-                          className="w-full"
-                        />
-                        <div className="flex justify-between mt-2 text-xs text-slate-400">
-                          {[0, 1, 2, 3, 4, 5].map((stage) => (
-                            <span key={stage}>{stage}</span>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Description */}
-                    <div className="bg-slate-700/30 rounded-xl p-6 border border-slate-600/50">
-                      <p className="text-slate-200 leading-relaxed">
-                        {stageDescriptions[devStage] || "No description available for this stage."}
-                      </p>
-                    </div>
-                  </div>
-                </TabsContent>
-              </Tabs>
+              </div>
             </div>
           </div>
         </div>

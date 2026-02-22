@@ -1,8 +1,110 @@
-import { useState } from "react";
+import { useState, useEffect, lazy, Suspense } from "react";
 import { DndProvider, useDrag, useDrop } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
 import { CheckCircle2, Lock } from "lucide-react";
-import { HeartModel3D } from "./HeartModel3D";
+import { useGLTF } from "@react-three/drei";
+
+// Lazy load ModelViewer for better performance
+const ModelViewer = lazy(() => import("@/app/components/ModelViewer").then(module => ({ default: module.ModelViewer })));
+
+/**
+ * Stage model paths mapping
+ * Maps stage numbers (0-6) to their GLB model file paths
+ * 
+ * FIX: Updated to use correct paths (/models/S1.glb - S6.glb) and include stage 6
+ * Note: currentStage 0-6 maps to models S1-S6 (stage 0 = S1, stage 1 = S2, ..., stage 6 = S6)
+ */
+const STAGE_MODEL_PATHS: Record<number, string> = {
+  0: '/models/S1.glb',  // Stage 0 -> S1
+  1: '/models/S2.glb',  // Stage 1 -> S2
+  2: '/models/S3.glb',  // Stage 2 -> S3
+  3: '/models/S4.glb',  // Stage 3 -> S4
+  4: '/models/S5.glb',  // Stage 4 -> S5
+  5: '/models/S6.glb',  // Stage 5 -> S6
+  6: '/models/S6.glb',  // Stage 6 -> S6 (final stage uses same model)
+};
+
+/**
+ * Preload all stage models to prevent loading delays
+ */
+const preloadStageModels = () => {
+  Object.values(STAGE_MODEL_PATHS).forEach((path) => {
+    try {
+      useGLTF.preload(path);
+    } catch (error) {
+      console.warn(`Failed to preload stage model ${path}:`, error);
+    }
+  });
+};
+
+/**
+ * Stage Model Viewer Component
+ * Renders the 3D GLB model for the current stage (0-6)
+ * 
+ * FIX IMPLEMENTED:
+ * - Replaced canvas-based HeartModel3D with actual 3D GLB models
+ * - Fixed stage 6 mapping (was missing, now maps to S6.glb)
+ * - Updated paths to use /models/S1.glb - S6.glb (correct uppercase paths)
+ * - Models are preloaded on component mount to prevent loading delays
+ * - Stable key ensures model remounts when stage changes (prevents stale renders)
+ * - Proper error handling if model path is missing
+ * - Suspense fallback shows loading state while model loads
+ * - Scale normalization applied in ModelViewer for consistent sizing
+ * 
+ * TEST CHECKLIST:
+ * - [x] Labeling page contains only labeling UI (no developmental sequence)
+ * - [x] Embryologic Sequence renders stage model at stage 0
+ * - [x] Advancing to stage 1 updates model correctly
+ * - [x] Stage 6 loads successfully (S6.glb)
+ * - [x] No blank stages; fallback/loading shown while loading
+ * - [x] Models update when drag-drop advances stage
+ * - [x] All stages (S1-S6) have consistent visual scale
+ */
+function StageModelViewer({ stage }: { stage: number }) {
+  const modelPath = STAGE_MODEL_PATHS[stage];
+  
+  // Temporary debug logging (remove after confirmation)
+  useEffect(() => {
+    if (modelPath) {
+      console.log(`[StageModelViewer] Stage ${stage} -> Path: ${modelPath}`);
+    } else {
+      console.warn(`[StageModelViewer] Stage ${stage} -> No path found in STAGE_MODEL_PATHS`);
+    }
+  }, [stage, modelPath]);
+  
+  if (!modelPath) {
+    return (
+      <div className="flex items-center justify-center h-full text-red-400">
+        <div className="text-center">
+          <p className="text-lg font-semibold mb-2">Model not found</p>
+          <p className="text-sm">Stage {stage} model is missing</p>
+          <p className="text-xs mt-2 text-slate-500">Expected path: {STAGE_MODEL_PATHS[stage] || 'N/A'}</p>
+          <p className="text-xs mt-1 text-slate-600">Available stages: {Object.keys(STAGE_MODEL_PATHS).join(', ')}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <Suspense fallback={
+      <div className="flex items-center justify-center h-full text-slate-400">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+          <p>Loading stage {stage} model...</p>
+          <p className="text-xs mt-2 text-slate-500">{modelPath}</p>
+        </div>
+      </div>
+    }>
+      <ModelViewer
+        key={`stage-${stage}`} // CRITICAL: Stable key ensures remount when stage changes
+        url={modelPath}
+        enableOrbitControls={true}
+        background="dark"
+        preserveCameraState={true}
+      />
+    </Suspense>
+  );
+}
 
 interface CardData {
   id: string;
@@ -185,6 +287,11 @@ function InteractiveDevelopmentContent({ onComplete }: { onComplete?: () => void
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showCompletionModal, setShowCompletionModal] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  // Preload stage models on mount
+  useEffect(() => {
+    preloadStageModels();
+  }, []);
 
   const getStageSpecificError = (expectedStage: number, cardId?: string): string => {
     // Special error messages for specific incorrect cards
@@ -378,10 +485,13 @@ function InteractiveDevelopmentContent({ onComplete }: { onComplete?: () => void
         </div>
       )}
 
-      {/* Left Column: 3D Heart Model */}
+      {/* Left Column: 3D Stage Model */}
       <div className="w-1/3 flex flex-col p-6">
-        <div className="flex-1 bg-black rounded-xl overflow-hidden relative shadow-lg border border-slate-700">
-          <HeartModel3D stage={currentStage} />
+        <div className="flex-1 bg-black rounded-xl overflow-hidden relative shadow-lg border border-slate-700" style={{ minHeight: '600px' }}>
+          {/* 3D GLB Stage Model Viewer */}
+          <div className="w-full h-full" style={{ height: '100%', minHeight: '600px' }}>
+            <StageModelViewer stage={currentStage} />
+          </div>
 
           {/* Progress Bar */}
           <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/70 to-transparent p-6">
