@@ -10,6 +10,7 @@ export interface Label3D {
   text: string;
   color: string;
   position: [number, number, number];
+  status?: "unplaced" | "correct" | "incorrect";
 }
 
 export interface PickResult {
@@ -77,9 +78,27 @@ const LabelMarker = memo(({ label }: { label: Label3D }) => {
   
   // Convert hex color to THREE.Color
   const color = new THREE.Color(label.color);
+  const statusColor = label.status === "correct"
+    ? "#22C55E"
+    : label.status === "incorrect"
+    ? "#EF4444"
+    : "#000000";
   
   return (
     <group position={labelPosition}>
+      {/* Status halo keeps correctness visible while preserving structure color */}
+      {label.status && label.status !== "unplaced" && (
+        <mesh>
+          <sphereGeometry args={[0.03, 16, 16]} />
+          <meshBasicMaterial
+            color={statusColor}
+            transparent
+            opacity={0.85}
+            depthTest={false}
+          />
+        </mesh>
+      )}
+
       {/* Small colored sphere as marker dot */}
       <mesh>
         <sphereGeometry args={[0.02, 16, 16]} />
@@ -99,7 +118,7 @@ const LabelMarker = memo(({ label }: { label: Label3D }) => {
         anchorY="middle"
         color="white"
         outlineWidth={0.01}
-        outlineColor="#000000"
+        outlineColor={statusColor}
         depthTest={false} // Prevent text from disappearing behind model
         renderOrder={1000} // Render on top
       >
