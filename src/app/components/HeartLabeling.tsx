@@ -5,26 +5,26 @@ import confetti from "canvas-confetti";
 import { ModelViewerApi, Label3D } from "@/app/components/ModelViewer";
 import { heartStructures, getStructureByMeshName, getStructureById, normalizeMeshName } from "@/data/heartStructures";
 import { useGLTF } from "@react-three/drei";
-import * as THREE from "three";
 
 // Lazy load ModelViewer to prevent blocking the entire app
 const ModelViewer = lazy(() => import("@/app/components/ModelViewer").then(module => ({ default: module.ModelViewer })));
 
 type LabelStatus = "unplaced" | "correct" | "incorrect";
 type CardiacStructureId = "RA" | "LA" | "RV" | "LV" | "TA" | "BC";
+type Vec3 = [number, number, number];
+type HeartLabelKey = CardiacStructureId;
 
-interface LabelTarget {
-  id: CardiacStructureId;
-  label: string;
-  targetPosition: [number, number, number];
-  tolerance: number;
-}
+type CoordinateRange = {
+  x: [number, number];
+  y: [number, number];
+  z: [number, number];
+};
 
 interface PlacedLabel {
   markerId: string;
   id: CardiacStructureId;
   label: string;
-  position: [number, number, number];
+  position: Vec3;
   status: LabelStatus;
   distanceFromTarget?: number;
   placedAt: number; // Timestamp for stable sorting
@@ -32,20 +32,44 @@ interface PlacedLabel {
 
 const LABEL_CALIBRATION_MODE = true;
 
-// TODO: Calibrate these coordinates from the real GLB by enabling LABEL_CALIBRATION_MODE and clicking the correct anatomical regions.
+// TODO: Calibrate these ranges from the real GLB by enabling LABEL_CALIBRATION_MODE and clicking the correct anatomical regions.
 // RA Right Atrium: Target should be on the blue atrium/large anterior chamber area.
 // LA Left Atrium: Target should be on the green atrial region.
 // RV Right Ventricle: Target should be on the orange/yellow ventricle region.
 // LV Left Ventricle: Target should be on the large blue ventricular chamber, lower/central body.
 // TA Truncus Arteriosus: Target should be on the upper pink Y-shaped outflow tract.
 // BC Bulbus Cordis: Target should be on the green-to-pink outflow tract transition, near the base of the pink split.
-const CARDIAC_LABEL_TARGETS: Record<CardiacStructureId, LabelTarget> = {
-  RA: { id: "RA", label: "Right Atrium", targetPosition: [0.2, 0.3, 0.1], tolerance: 0.35 },
-  LA: { id: "LA", label: "Left Atrium", targetPosition: [-0.2, 0.32, 0.12], tolerance: 0.35 },
-  RV: { id: "RV", label: "Right Ventricle", targetPosition: [0.3, -0.1, 0.05], tolerance: 0.35 },
-  LV: { id: "LV", label: "Left Ventricle", targetPosition: [-0.22, -0.15, 0.04], tolerance: 0.35 },
-  TA: { id: "TA", label: "Truncus Arteriosus", targetPosition: [0.0, 0.55, 0.05], tolerance: 0.35 },
-  BC: { id: "BC", label: "Bulbus Cordis", targetPosition: [0.06, 0.35, 0.08], tolerance: 0.35 },
+const HEART_LABEL_RANGES: Record<HeartLabelKey, CoordinateRange> = {
+  RA: {
+    x: [-0.53, -0.17],
+    y: [0.05, 0.41],
+    z: [-0.06, 0.30],
+  },
+  LA: {
+    x: [0.03, 0.39],
+    y: [0.10, 0.46],
+    z: [-0.04, 0.32],
+  },
+  RV: {
+    x: [-0.48, -0.12],
+    y: [-0.37, -0.01],
+    z: [0.21, 0.57],
+  },
+  LV: {
+    x: [0.04, 0.40],
+    y: [-0.19, 0.17],
+    z: [0.15, 0.51],
+  },
+  TA: {
+    x: [-0.32, -0.02],
+    y: [0.44, 0.74],
+    z: [0.02, 0.32],
+  },
+  BC: {
+    x: [-0.28, 0.08],
+    y: [0.11, 0.47],
+    z: [0.22, 0.58],
+  },
 };
 
 function toCardiacStructureId(id: string): CardiacStructureId | null {
@@ -56,21 +80,31 @@ function toCardiacStructureId(id: string): CardiacStructureId | null {
   return null;
 }
 
-function validateLabelPlacement(structureId: CardiacStructureId, clickedPoint: [number, number, number]): {
+function isPointInRange(point: Vec3, range: CoordinateRange): boolean {
+  const [x, y, z] = point;
+  return (
+    x >= range.x[0] &&
+    x <= range.x[1] &&
+    y >= range.y[0] &&
+    y <= range.y[1] &&
+    z >= range.z[0] &&
+    z <= range.z[1]
+  );
+}
+
+function validateLabelPlacement(structureId: CardiacStructureId, clickedPoint: Vec3): {
   status: "correct" | "incorrect";
-  distance: number;
-  tolerance: number;
+  range: CoordinateRange;
+  inRange: boolean;
 } {
-  const target = CARDIAC_LABEL_TARGETS[structureId];
-  const clicked = new THREE.Vector3(...clickedPoint);
-  const targetVector = new THREE.Vector3(...target.targetPosition);
-  const distance = clicked.distanceTo(targetVector);
-  const status: "correct" | "incorrect" = distance <= target.tolerance ? "correct" : "incorrect";
+  const range = HEART_LABEL_RANGES[structureId];
+  const inRange = isPointInRange(clickedPoint, range);
+  const status: "correct" | "incorrect" = inRange ? "correct" : "incorrect";
 
   return {
     status,
-    distance,
-    tolerance: target.tolerance,
+    range,
+    inRange,
   };
 }
 
@@ -222,7 +256,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
         const [x, y, z] = hit.point;
         console.log(`[LabelCalibration] ${selectedStructureId} clicked at: [${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)}]`);
         console.log(
-          `[LabelValidation] ${selectedStructureId}: distance=${validation.distance.toFixed(4)}, tolerance=${validation.tolerance}, status=${validation.status}`
+          `[LabelValidation] ${selectedStructureId}: point=[${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)}], range={x:[${validation.range.x[0].toFixed(2)}, ${validation.range.x[1].toFixed(2)}], y:[${validation.range.y[0].toFixed(2)}, ${validation.range.y[1].toFixed(2)}], z:[${validation.range.z[0].toFixed(2)}, ${validation.range.z[1].toFixed(2)}]}, status=${validation.status}`
         );
       }
 
@@ -233,7 +267,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
         label: selectedStructure?.displayName || selectedStructureId,
         position: hit.point,
         status: validation.status,
-        distanceFromTarget: validation.distance,
+        distanceFromTarget: undefined,
         placedAt: Date.now(),
       };
 
@@ -249,7 +283,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
         const [x, y, z] = hit.point;
         console.log(`[LabelCalibration] ${selectedStructureId} clicked at: [${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)}]`);
         console.log(
-          `[LabelValidation] ${selectedStructureId}: distance=${validation.distance.toFixed(4)}, tolerance=${validation.tolerance}, status=${validation.status}`
+          `[LabelValidation] ${selectedStructureId}: point=[${x.toFixed(4)}, ${y.toFixed(4)}, ${z.toFixed(4)}], range={x:[${validation.range.x[0].toFixed(2)}, ${validation.range.x[1].toFixed(2)}], y:[${validation.range.y[0].toFixed(2)}, ${validation.range.y[1].toFixed(2)}], z:[${validation.range.z[0].toFixed(2)}, ${validation.range.z[1].toFixed(2)}]}, status=${validation.status}`
         );
       }
 
@@ -260,7 +294,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
         label: selectedStructure?.displayName || selectedStructureId,
         position: hit.point,
         status: validation.status,
-        distanceFromTarget: validation.distance,
+        distanceFromTarget: undefined,
         placedAt: Date.now(),
       };
 
@@ -270,23 +304,57 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
   }, [selectedStructureId]);
 
   const handleCheckLabels = () => {
-    const allPlaced = heartStructures.every(structure => 
-      placedLabels.some(label => label.id === structure.id.toUpperCase())
-    );
+    const totalLabels = heartStructures.length;
+    const placedCount = placedLabels.length;
 
-    if (allPlaced) {
+    if (placedCount < totalLabels) {
+      showToastMessage("Please place all labels before checking");
+      return;
+    }
+
+    const nextPlacedLabels = placedLabels.map((label) => {
+      const validation = validateLabelPlacement(label.id, label.position);
+      return {
+        ...label,
+        status: validation.status,
+      };
+    });
+
+    const validationResults = nextPlacedLabels.reduce<Record<CardiacStructureId, LabelStatus>>((acc, label) => {
+      acc[label.id] = label.status;
+      return acc;
+    }, {} as Record<CardiacStructureId, LabelStatus>);
+
+    const correctCount = nextPlacedLabels.filter((label) => label.status === "correct").length;
+    const allPlaced = placedCount === totalLabels;
+    const allCorrect = correctCount === totalLabels;
+
+    console.log("[HeartLabeling] Check labels:", {
+      placedCount,
+      correctCount,
+      totalLabels,
+      allPlaced,
+      allCorrect,
+      validationResults,
+    });
+
+    setPlacedLabels(nextPlacedLabels);
+
+    if (allCorrect) {
       setShowResults(true);
       onComplete?.();
-      
+
       confetti({
         particleCount: 100,
         spread: 70,
         origin: { y: 0.6 },
-        colors: ['#10B981', '#34D399', '#6EE7B7']
+        colors: ["#10B981", "#34D399", "#6EE7B7"],
       });
-    } else {
-      showToastMessage("Please place all labels before checking");
+      return;
     }
+
+    setShowResults(false);
+    showToastMessage(`You have ${correctCount} / ${totalLabels} correct. Adjust and try again.`);
   };
 
   const handleReset = () => {
@@ -312,6 +380,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
     placedLabels.some(label => label.id === structure.id.toUpperCase())
   );
   const correctCount = placedLabels.filter(label => label.status === "correct").length;
+  const allLabelsCorrect = allLabelsPlaced && correctCount === heartStructures.length;
 
   return (
     <section className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 py-20 px-6">
@@ -430,7 +499,7 @@ export function HeartLabeling({ onComplete }: HeartLabelingProps) {
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl shadow-2xl p-8 border border-slate-700/50">
               {/* Labeling Mode Content */}
               <div>
-                  {showResults && allLabelsPlaced ? (
+                  {showResults && allLabelsCorrect ? (
                     /* Success State */
                     <div>
                       <div className="text-center mb-8">
